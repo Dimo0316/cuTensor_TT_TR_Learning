@@ -1,5 +1,7 @@
 # cuTensor_TT_TR_Learning
+
 This repository contains applications for TT tensor learning using GPU tensor cores, including TT/TR tensor decompostion, TT tensor layer and DMRG algorithm. 
+
 
 ## File structure
 
@@ -36,4 +38,4 @@ This repository contains applications for TT tensor learning using GPU tensor co
 >> DMRG
 >>> python -------- TensorNetwork-JAX <br>
 >>> baseline ------- unoptimized <br>
->>> optimized -------- optimized using GPU tensor cores<br>
+>>> optimized -------- optimized <br>
