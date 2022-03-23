@@ -1,4 +1,4 @@
-# cuTensor_TT_TR_Learning
+#                     TT and TR Tensor Learning Using GPU Tensor Cores
 
 This repository contains applications for TT tensor learning using GPU tensor cores, including TT/TR tensor decompostion, TT tensor layer and DMRG algorithm. 
 
@@ -48,3 +48,16 @@ This repository contains applications for TT tensor learning using GPU tensor co
 >>> python -------- TensorNetwork-JAX <br>
 >>> baseline ------- unoptimized <br>
 >>> optimized -------- optimized <br>
+
+
+## CONTACT US
+
+> Tensor and Deep Learning Lab LLC. 
+
+> E-Mail:** tensorlet@gmail.com
+
+> TensorLet Group: [http://www.tensorlet.com/projects/cutensor/] 
+
+> github:**[https://github.com/Dimo0316/cuTensor_TT_TR_Learning](https://github.com/Dimo0316/cuTensor_TT_TR_Learning)
+
+> Notice: both US and China patents are filed for this project.
