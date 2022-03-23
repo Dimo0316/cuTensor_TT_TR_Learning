@@ -56,8 +56,6 @@ This repository contains applications for TT tensor learning using GPU tensor co
 
 > E-Mail:** tensorlet@gmail.com
 
-> TensorLet Group: [http://www.tensorlet.com/projects/cutensor/] 
-
 > github:**[https://github.com/Dimo0316/cuTensor_TT_TR_Learning](https://github.com/Dimo0316/cuTensor_TT_TR_Learning)
 
 > Notice: both US and China patents are filed for this project.
