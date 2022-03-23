@@ -11,7 +11,7 @@ This repository contains applications for TT tensor learning using GPU tensor co
 >>>> python -------- python implementations  <br>
 >>>> unopt -------- unoptimized on single GPU <br>
 >>>> opt -------- optimized on single GPU <br>
->>>> ablation -------- ablition experiments <br>
+
 
 >>> high_order -------- high order tt decomposition <br>
 >>>> python -------- python implementations <br>
@@ -34,6 +34,10 @@ This repository contains applications for TT tensor learning using GPU tensor co
 >>>> trdec6_multiGPUs_4.cu -------- optimized on four GPUs  <br>
 >>>> trdec6_multiGPUs_8.cu -------- optimized on eight GPUs  <br>
 
+>> ablation -------- ablition experiments <br>
+>>> edrsvd -------- only EDrSVD <br>
+>>> edrsvd_pipeline -------- EDrSVD using piepline <br>
+>>> edrsvd_rensor_contractions -------- EDrSVD using tensor contractions <br>
 
 >> TT_tensor_layer
 >>> mnist.py -------- fully connect <br>
