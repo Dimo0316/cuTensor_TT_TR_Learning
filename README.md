@@ -11,11 +11,14 @@ This repository contains applications for TT tensor learning using GPU tensor co
 >>>> python -------- python implementations  <br>
 >>>> unopt -------- unoptimized on single GPU <br>
 >>>> opt -------- optimized on single GPU <br>
+>>>> ablation -------- ablition experiments <br>
 
 >>> high_order -------- high order tt decomposition <br>
 >>>> python -------- python implementations <br>
 >>>> ttdec6_singleGPU.cu -------- optimized single GPU <br>
->>>> ttdec6_multiGPUs.cu -------- optimized on multiple GPUs <br>
+>>>> ttdec6_multiGPUs_2.cu -------- optimized on two GPUs <br>
+>>>> ttdec6_multiGPUs_4.cu -------- optimized on four GPUs <br>
+>>>> ttdec6_multiGPUs_8.cu -------- optimized on eight GPUs <br>
 
 
 >> trdecomposition
@@ -27,7 +30,9 @@ This repository contains applications for TT tensor learning using GPU tensor co
 >>> high_order -------- high order tr decomposition <br>
 >>>> python -------- python implementations <br>
 >>>> trdec6_singleGPU.cu -------- optimized on single GPU  <br>
->>>> trdec6_multiGPUs.cu -------- optimized on multiple GPUs  <br>
+>>>> trdec6_multiGPUs_2.cu -------- optimized on two GPUs  <br>
+>>>> trdec6_multiGPUs_4.cu -------- optimized on four GPUs  <br>
+>>>> trdec6_multiGPUs_8.cu -------- optimized on eight GPUs  <br>
 
 
 >> TT_tensor_layer
