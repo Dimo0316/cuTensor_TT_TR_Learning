@@ -957,13 +957,12 @@ float ttdec_half_lu_host_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDe
         cublas_status = cublasSetMathMode(cublasH3, mathMode);
         assert(CUBLAS_STATUS_SUCCESS == cublas_status);
 
-        // cudaStat1 = cudaMalloc((void**)&d_A1, sizeof(dt)*m*n_half);
         cudaStat2 = cudaMalloc((void**)&d_AAT3, sizeof(dt)*m*m);
         cudaStat3 = cudaMalloc((void**)&d_A23, sizeof(dt)*ttRanks[1]*n_half);
         cudaStat4 = cudaMalloc((void**)&d_G13, sizeof(dt)*m*ttRanks[1]);
-        assert(cudaStat1 == cudaSuccess);
         assert(cudaStat2 == cudaSuccess);
-        // assert(cudaStat3 == cudaSuccess);
+        assert(cudaStat3 == cudaSuccess);
+        assert(cudaStat4 == cudaSuccess);
 
         cudaSetDevice(device[2]);
         cublas_status = cublasCreate(&cublasH2);
@@ -971,13 +970,12 @@ float ttdec_half_lu_host_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDe
         cublas_status = cublasSetMathMode(cublasH2, mathMode);
         assert(CUBLAS_STATUS_SUCCESS == cublas_status);
 
-        // cudaStat1 = cudaMalloc((void**)&d_A1, sizeof(dt)*m*n_half);
         cudaStat2 = cudaMalloc((void**)&d_AAT2, sizeof(dt)*m*m);
         cudaStat3 = cudaMalloc((void**)&d_A22, sizeof(dt)*ttRanks[1]*n_half);
         cudaStat4 = cudaMalloc((void**)&d_G12, sizeof(dt)*m*ttRanks[1]);
-        assert(cudaStat1 == cudaSuccess);
         assert(cudaStat2 == cudaSuccess);
-        // assert(cudaStat3 == cudaSuccess);
+        assert(cudaStat3 == cudaSuccess);
+        assert(cudaStat4 == cudaSuccess);
 
         cudaSetDevice(device[1]);
         cublas_status = cublasCreate(&cublasH1);
@@ -985,13 +983,12 @@ float ttdec_half_lu_host_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDe
         cublas_status = cublasSetMathMode(cublasH1, mathMode);
         assert(CUBLAS_STATUS_SUCCESS == cublas_status);
 
-        // cudaStat1 = cudaMalloc((void**)&d_A1, sizeof(dt)*m*n_half);
         cudaStat2 = cudaMalloc((void**)&d_AAT1, sizeof(dt)*m*m);
         cudaStat3 = cudaMalloc((void**)&d_A21, sizeof(dt)*ttRanks[1]*n_half);
         cudaStat4 = cudaMalloc((void**)&d_G11, sizeof(dt)*m*ttRanks[1]);
-        assert(cudaStat1 == cudaSuccess);
         assert(cudaStat2 == cudaSuccess);
-        // assert(cudaStat3 == cudaSuccess);
+        assert(cudaStat3 == cudaSuccess);
+        assert(cudaStat4 == cudaSuccess);
 
         cudaSetDevice(device[0]);
         cublas_status = cublasCreate(&cublasH);
@@ -999,11 +996,9 @@ float ttdec_half_lu_host_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDe
         cublas_status = cublasSetMathMode(cublasH, mathMode);
         assert(CUBLAS_STATUS_SUCCESS == cublas_status);
 
-        // cudaStat1 = cudaMalloc((void**)&d_A0, sizeof(dt)*m*n_half);
         cudaStat2 = cudaMalloc((void**)&d_AAT0, sizeof(dt)*m*m);
         cudaStat3 = cudaMalloc((void**)&d_AAT, sizeof(dt)*m*m);
         cudaStat4 = cudaMalloc((void**)&d_A2, sizeof(dt)*n*ttRanks[1]);
-        assert(cudaStat1 == cudaSuccess);
         assert(cudaStat2 == cudaSuccess);
         assert(cudaStat3 == cudaSuccess);
         assert(cudaStat4 == cudaSuccess);

@@ -8,10 +8,9 @@
 #include <curand.h>
 #include <cufft.h>
 #include <cuda_fp16.h>
-#include <cublasXt.h>
 
-// /usr/local/cuda/bin/nvcc -Xcompiler -fopenmp -lcublas -lcusolver -lcurand -std=c++11 ttdec6_multiGPUs2.cu -o multiGPUs2
-// /xfs/home/tensor_zy/anaconda3/envs/ht2/bin/nvcc -Xcompiler -fopenmp -lcublas -lcusolver -lcurand -std=c++11 ttdec6_multiGPUs_8.cu -o multiGPUs8
+// /usr/local/cuda/bin/nvcc -Xcompiler -fopenmp -lcublas -lcusolver -lcurand -std=c++11 rtdec6_multiGPUs4.cu -o multiGPUs2
+// /xfs/home/tensor_zy/anaconda3/envs/ht2/bin/nvcc -Xcompiler -fopenmp -lcublas -lcusolver -lcurand -std=c++11 trdec6_multiGPUs_4.cu -o multiGPUs4
 
 using namespace std;
 typedef float dt;   
@@ -36,27 +35,19 @@ __global__ void warmup()
     }
 }   
 
-void printMatrix(int m, int n, const dt*A, int lda, const char* name)
-{
-    for(int row = 0 ; row < m ; row++){
-        for(int col = 0 ; col < n ; col++){
-            float Areg = A[row + col*lda];
-            printf("%s(%d,%d) = %f\n", name, row+1, col+1, Areg);
-        }
-    }
-    cout << " ------------------------------------" << endl;
-}
-// nvcc -lcublas -lcusolver -lcurand -std=c++11 svd.cu -o svd
-void printMatrix_Device(int m, int n, const dt*d_A, int lda, const char* name)
-{
-    dt *h_A = NULL;
-    cudaHostAlloc((void**)&h_A , sizeof(dt)*m*n, 1);
-    cudaMemcpy(h_A, d_A, sizeof(dt)*m*n, cudaMemcpyDeviceToHost);
-    printMatrix(m, n, h_A, lda, name);
-    if(h_A) cudaFreeHost(h_A);
-}
 void warmupcu(){
     warmup<<<1,1>>>();
+}
+
+__global__ void tensorToMode231(dt *T1,dt *T2,int m,int n,int k){
+    int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<m*n*k){
+        int tube = i/(m*n);
+        int row = (i-tube*(m*n))%m;
+        int col = (i-tube*(m*n))/m;
+        T2[row*k*n+tube*n+col] = T1[tube*m*n+col*m+row]; //T1[i]
+    }
+    __syncthreads();
 }
 
 struct GPUTimer
@@ -91,13 +82,22 @@ struct GPUTimer
     cudaEvent_t start_, stop_;
 };
 
+void tensorToMode3_host(dt *T1, dt *T2 , long long m, long long n, long long k){
+    for(long long i = 0; i < m*n*k; ++i){
+        long long tube = i/(m*n);
+        long long row = (i-tube*(m*n))%m;
+        long long col = (i-tube*(m*n))/m;
+        T2[k*col*m+row*k+tube] = T1[tube*m*n+col*m+row];
+    }
+}
+
 double norm2HH(float *A, long long len){
   printf("%lld\n", len);
   double norm2Result = 0.0;
   for(long long i = 0; i < len; ++i){
     norm2Result += (A[i] * A[i]);
-    // if(i%100000000 == 0)
-    //     printf("%f\n", norm2Result);
+    if(i%100000000 == 0)
+        printf("%f\n", norm2Result);
   }
   norm2Result = sqrtf(norm2Result);
   return norm2Result;
@@ -157,7 +157,6 @@ double calMSE(cublasHandle_t cublasH, dt *h_A, dt *h_G1, dt *h_G2, dt *h_G3, dt 
     double normA = norm2HH(h_A, calNumber);
     cout<<"normA: "<<normA<<endl;
     dt *h_G56=NULL, *h_G456=NULL, *h_G3456=NULL, *h_G23456=NULL, *h_G123456=NULL;
-    
     cudaStat3 = cudaMallocHost((void**)&h_G56, sizeof(dt)*ttRanks[4] *ttDemns[4]*ttDemns[5]* ttRanks[6]);
     assert(cudaStat3 == cudaSuccess);
     smallargeMatrixMulti_slice_host(cublasH, h_G5, h_G6, ttRanks[4]*ttDemns[4], ttRanks[5], ttDemns[5]*ttRanks[6], h_G56, 1, beta0);
@@ -185,6 +184,87 @@ double calMSE(cublasHandle_t cublasH, dt *h_A, dt *h_G1, dt *h_G2, dt *h_G3, dt 
     double MSE = normAr/normA;
     return MSE;
 }
+void generalTRTensor(dt *h_A, const int *ttRanks, const int *ttDemns, const int &p){
+    dt *h_G56=NULL, *h_G456=NULL, *h_G3456=NULL, *h_G23456=NULL, *h_G123456=NULL, *h_G23456_mid=NULL;
+    dt *h_G1=NULL,  *h_G2=NULL,  *h_G3=NULL,  *h_G4=NULL,  *h_G5=NULL,  *h_G6=NULL;
+    cublasHandle_t cublasH = NULL;
+    cublas_status = cublasCreate(&cublasH);
+    assert(CUBLAS_STATUS_SUCCESS == cublas_status);
+    cublas_status = cublasSetMathMode(cublasH, mathMode);
+    assert(CUBLAS_STATUS_SUCCESS == cublas_status);
+
+    cudaStat1 = cudaMallocHost((void**)&h_G5, sizeof(dt)*ttRanks[4]*ttDemns[4]*ttRanks[5]);
+    cudaStat2 = cudaMallocHost((void**)&h_G6, sizeof(dt)*ttRanks[5]*ttDemns[5]*ttRanks[6]);
+    assert(cudaStat1 == cudaSuccess);
+    assert(cudaStat2 == cudaSuccess);
+    srand(1134);
+    for(long long i = 0; i < ttRanks[4]*ttDemns[4]*ttRanks[5]; i++){
+        // h_G5[i] = (dt) ((rand()*1.0) / (RAND_MAX*1.0))*2.0 - 1.0;
+        h_G5[i] = (dt) ((rand()*1.0) / (RAND_MAX*1.0))*2.0 - 1.0;
+    }
+    for(long long i = 0; i < ttRanks[5]*ttDemns[5]*ttRanks[6]; i++){
+        h_G6[i] = (dt) ((rand()*1.0) / (RAND_MAX*1.0))*2.0 - 1.0;
+    }
+    
+    cudaStat3 = cudaMallocHost((void**)&h_G56, sizeof(dt)*ttRanks[4] *ttDemns[4]*ttDemns[5]* ttRanks[6]);
+    assert(cudaStat3 == cudaSuccess);
+    smallargeMatrixMulti_slice_host(cublasH, h_G5, h_G6, ttRanks[4]*ttDemns[4], ttRanks[5], ttDemns[5]*ttRanks[6], h_G56, 1, beta0);
+    if(h_G5) cudaFreeHost(h_G5);h_G5=NULL;
+    if(h_G6) cudaFreeHost(h_G6);h_G6=NULL;
+
+    cudaStat1 = cudaMallocHost((void**)&h_G4, sizeof(dt)*ttRanks[3]*ttDemns[3]*ttRanks[4]);
+    assert(cudaStat1 == cudaSuccess);
+    for(long long i = 0; i < ttRanks[3]*ttDemns[3]*ttRanks[4]; i++){
+        h_G4[i] = (dt) ((rand()*1.0) / (RAND_MAX*1.0))*2.0 - 1.0;
+    }
+    cudaStat3 = cudaMallocHost((void**)&h_G456, sizeof(dt)*ttRanks[3] *ttDemns[3]*ttDemns[4]*ttDemns[5]* ttRanks[6]);
+    assert(cudaStat3 ==cudaSuccess);
+    smallargeMatrixMulti_slice_host(cublasH, h_G4, h_G56, ttRanks[3]*ttDemns[3], ttRanks[4], ttDemns[4]*ttDemns[5]*ttRanks[6], h_G456, 1, beta0);
+    if(h_G56) cudaFreeHost(h_G56);h_G56=NULL;
+    if(h_G4) cudaFreeHost(h_G4);h_G4=NULL;
+
+    cudaStat1 = cudaMallocHost((void**)&h_G3, sizeof(dt)*ttRanks[2]*ttDemns[2]*ttRanks[3]);
+    assert(cudaStat1 == cudaSuccess);
+    for(long long i = 0; i < ttRanks[2]*ttDemns[2]*ttRanks[3]; i++){
+        h_G3[i] = (dt) ((rand()*1.0) / (RAND_MAX*1.0))*2.0 - 1.0;
+    }
+    cudaStat3 = cudaMallocHost((void**)&h_G3456, sizeof(dt)*ttRanks[2]*ttDemns[2]*ttDemns[3]*ttDemns[4]*ttDemns[5]*ttRanks[6]);
+    assert(cudaStat3 == cudaSuccess);
+    smallargeMatrixMulti_slice_host(cublasH, h_G3, h_G456, ttRanks[2]*ttDemns[2], ttRanks[3], ttDemns[3]*ttDemns[4]*ttDemns[5]*ttRanks[6], h_G3456, 1, beta0);
+
+    if(h_G456) cudaFreeHost(h_G456);h_G456=NULL;
+    if(h_G3) cudaFreeHost(h_G3);h_G3=NULL;
+
+    cudaStat1 = cudaMallocHost((void**)&h_G2, sizeof(dt)*ttRanks[1]*ttDemns[1]*ttRanks[2]);
+    assert(cudaStat1 == cudaSuccess);
+    for(long long i = 0; i < ttRanks[1]*ttDemns[1]*ttRanks[2]; i++){
+        h_G2[i] = (dt) ((rand()*1.0) / (RAND_MAX*1.0))*2.0 - 1.0;
+    }
+    cudaStat3 = cudaMallocHost((void**)&h_G23456, sizeof(dt)*ttRanks[1]*ttDemns[1]*ttDemns[2]*ttDemns[3]*ttDemns[4]*ttDemns[5]*ttRanks[6]);
+    assert(cudaStat3 == cudaSuccess);
+    smallargeMatrixMulti_slice_host(cublasH, h_G2, h_G3456, ttRanks[1]*ttDemns[1], ttRanks[2], ttDemns[2]*ttDemns[3]*ttDemns[4]*ttDemns[5]*ttRanks[6], h_G23456, 4, beta0);
+
+    if(h_G3456) cudaFreeHost(h_G3456); h_G3456 =NULL;
+    if(h_G2) cudaFreeHost(h_G2);h_G2=NULL;
+///TODO 让G23456 变换形式
+    cudaStat3 = cudaMallocHost((void**)&h_G23456_mid, sizeof(dt)*ttRanks[1]*ttDemns[1]*ttDemns[2]*ttDemns[3]*ttDemns[4]*ttDemns[5]*ttRanks[6]);
+    assert(cudaStat3 == cudaSuccess);
+
+    tensorToMode3_host(h_G23456, h_G23456_mid, ttRanks[1], ttDemns[1]*ttDemns[2]*ttDemns[3]*ttDemns[4]*ttDemns[5], ttRanks[6]);
+    if(h_G23456) cudaFreeHost(h_G23456); h_G23456 =NULL;
+
+
+    cudaStat1 = cudaMallocHost((void**)&h_G1, sizeof(dt)*ttRanks[0]*ttDemns[0]*ttRanks[1]);
+    assert(cudaStat1 == cudaSuccess);
+    for(long long i = 0; i < ttRanks[0]*ttDemns[0]*ttRanks[1]; i++){
+        h_G1[i] = (dt) ((rand()*1.0) / (RAND_MAX*1.0))*2.0 - 1.0;
+    }
+
+    smallargeMatrixMulti_slice_host(cublasH, h_G1, h_G23456_mid, ttDemns[0], ttRanks[0]*ttRanks[1], ttDemns[1]*ttDemns[2]*ttDemns[3]*ttDemns[4]*ttDemns[5], h_A, p, beta0);
+    if(h_G23456_mid) cudaFreeHost(h_G23456_mid); h_G23456_mid =NULL;
+    if(h_G1) cudaFreeHost(h_G1);h_G1=NULL;
+    if(cublasH  ) cublasDestroy(cublasH); cublasH = NULL;
+}
 
 void generalTTTensor(dt *h_A, const int *ttRanks, const int *ttDemns, const int &p){
     dt *h_G56=NULL, *h_G456=NULL, *h_G3456=NULL, *h_G23456=NULL, *h_G123456=NULL;
@@ -195,7 +275,7 @@ void generalTTTensor(dt *h_A, const int *ttRanks, const int *ttDemns, const int 
     cublas_status = cublasSetMathMode(cublasH, mathMode);
     assert(CUBLAS_STATUS_SUCCESS == cublas_status);
 
-    // srand(123321);
+    srand(123321);
     cudaStat1 = cudaMallocHost((void**)&h_G5, sizeof(dt)*ttRanks[4]*ttDemns[4]*ttRanks[5]);
     cudaStat2 = cudaMallocHost((void**)&h_G6, sizeof(dt)*ttRanks[5]*ttDemns[5]*ttRanks[6]);
     assert(cudaStat1 == cudaSuccess);
@@ -237,6 +317,7 @@ void generalTTTensor(dt *h_A, const int *ttRanks, const int *ttDemns, const int 
     cudaStat3 = cudaMallocHost((void**)&h_G3456, sizeof(dt)*ttRanks[2]*ttDemns[2]*ttDemns[3]*ttDemns[4]*ttDemns[5]*ttRanks[6]);
     assert(cudaStat3 == cudaSuccess);
     smallargeMatrixMulti_slice_host(cublasH, h_G3, h_G456, ttRanks[2]*ttDemns[2], ttRanks[3], ttDemns[3]*ttDemns[4]*ttDemns[5]*ttRanks[6], h_G3456, 1, beta0);
+
     if(h_G456) cudaFreeHost(h_G456);h_G456=NULL;
     if(h_G3) cudaFreeHost(h_G3);h_G3=NULL;
 
@@ -282,6 +363,25 @@ void matrixInvertColumn(dt *d_A, dt *d_Ainv,const int &m, const int &n){
     matrixInvertColumn_kernel<<<blocks,threads>>>(d_A,d_Ainv,m,n);
 }
 
+void printMatrix(int m, int n, const dt*A, int lda, const char* name)
+{
+    for(int row = 0 ; row < m ; row++){
+        for(int col = 0 ; col < n ; col++){
+            float Areg = A[row + col*lda];
+            printf("%s(%d,%d) = %f\n", name, row+1, col+1, Areg);
+        }
+    }
+    cout << " ------------------------------------" << endl;
+}
+// nvcc -lcublas -lcusolver -lcurand -std=c++11 svd.cu -o svd
+void printMatrix_Device(int m, int n, const dt*d_A, int lda, const char* name)
+{
+    dt *h_A = NULL;
+    cudaHostAlloc((void**)&h_A , sizeof(dt)*m*n, 1);
+    cudaMemcpy(h_A, d_A, sizeof(dt)*m*n, cudaMemcpyDeviceToHost);
+    printMatrix(m, n, h_A, lda, name);
+    if(h_A) cudaFreeHost(h_A);
+}
 
 __global__  void floattohalf(dt *AA,half *BB,long m){
     long i = blockIdx.x*blockDim.x+threadIdx.x;
@@ -388,7 +488,6 @@ void smallargeMatrixMulti_once_device(cublasHandle_t cublasH, dt *d_A, dt *d_B, 
     if(d_Ah     ) cudaFree(d_Ah); d_Ah=NULL;
     if(d_Bh     ) cudaFree(d_Bh); d_Bh=NULL;
 }
-
 void smallargeMatrixMulti_slice_device(cublasHandle_t cublasH, dt *d_A, dt *d_B, const int &ttrank, const int &m, const long long &n, dt *d_ATB, const int &p){
     half *d_Ah = NULL, *d_Bh = NULL;
 
@@ -419,9 +518,9 @@ void longMatrixSVD_Eign_once_device(cublasHandle_t cublasH, cusolverDnHandle_t c
     dt *d_W=NULL, *d_AAT=NULL;
     cudaStat1 = cudaMalloc((void**)&d_AAT, sizeof(dt)*m*m);
     cudaStat2 = cudaMalloc((void**)&d_W, sizeof(dt)*m);
- 
     largeMatrixSelfMulti_once_device(cublasH, d_A, m, n, d_AAT);
     basicEig(cusolverH, d_AAT, m, d_W);
+
     if(d_W     ) cudaFree(d_W); d_W = NULL;
 
     matrixInvertColumn(d_AAT, d_G, m, ttRank);
@@ -435,24 +534,149 @@ void longMatrixSVD_Eign_once_device(cublasHandle_t cublasH, cusolverDnHandle_t c
     }
 }
 
-float ttdec_half_lu_device_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDemns, const int &calculateTimes, const int &p, bool calError){
+// 实现一个超大规模矩阵A的 A*AT，存储到GPU上
+void largeMatrixSelfMulti_slice_host(cublasHandle_t cublasH, dt *h_A,const int &m,const long long &n, dt *d_AAT,const int &p){
+    long long slice = 0, le = 0;
+    if(n%p==0){
+        slice = n/p;
+    }else{
+        slice = n/p;
+        le = n%p;
+    }
+
+    float *d_tempA =NULL; 
+    half *d_Ah = NULL;
+    cudaStat1 = cudaMalloc((void**)&d_tempA, sizeof(dt)*m*slice);
+    cudaStat2 = cudaMalloc((void**)&d_Ah, sizeof(half)*m*slice);
+    assert(cudaStat1 == cudaSuccess);
+    assert(cudaStat2 == cudaSuccess);
+    // printf("%d\n", slice);
+    for(int i=0;i<p;i++){
+        cudaStat3 = cudaMemcpyAsync(d_tempA, h_A+m*slice*i, sizeof(dt)*m*slice, cudaMemcpyHostToDevice,0);
+        cudaStat4 = cudaDeviceSynchronize();
+        assert(cudaStat3 == cudaSuccess);
+        assert(cudaStat4 == cudaSuccess);
+        f2h(d_tempA, d_Ah, m*slice);
+        cublas_status = cublasGemmEx(cublasH, CUBLAS_OP_N, CUBLAS_OP_T,
+                           m, m, slice,
+                           &alpha, d_Ah, CUDA_R_16F, m,
+                           d_Ah, CUDA_R_16F, m,
+                           &beta0, d_AAT, CUDA_R_32F, m,
+                           CUDA_R_32F, algo);
+        assert(cublas_status == CUBLAS_STATUS_SUCCESS);
+    }
+    if(d_Ah     ) cudaFree(d_Ah); d_Ah=NULL;
+    if(d_tempA  ) cudaFree(d_tempA); d_tempA=NULL;
+}
+
+
+void smallargeMatrixMulti_slice_host_Tans(cublasHandle_t cublasH, dt *d_A, dt *h_B, const int &ttrank, const int &m,  const long long &n, dt *h_ATB, const int &p){
+    long long slice = 0;
+    if(n%p==0)
+        slice = n/p;
+    else
+        assert("P is not slice");
+    // printf("ttrank: %d, n: %d",m,ttrank,n);
+    float *d_tempB = NULL, *d_tempATB = NULL; 
+    half *d_Ah = NULL, *d_Bh = NULL;
+    cudaStat1 = cudaMalloc((void**)&d_tempB, sizeof(dt)*m*slice);
+    cudaStat2 = cudaMalloc((void**)&d_tempATB, sizeof(dt)*ttrank*slice);
+    cudaStat3 = cudaMalloc((void**)&d_Ah, sizeof(half)*m*ttrank);
+    cudaStat4 = cudaMalloc((void**)&d_Bh, sizeof(half)*m*slice);
+    assert(cudaStat1 == cudaSuccess);
+    assert(cudaStat2 == cudaSuccess);
+    assert(cudaStat3 == cudaSuccess);
+    assert(cudaStat4 == cudaSuccess);
+
+    // printMatrix_Device(m, ttrank, d_A, m, "tempA");
+    f2h(d_A, d_Ah, m*ttrank);
+    // printf("%d\n", slice);
+    for(int i=0;i<p;i++){
+        cudaStat3 = cudaMemcpyAsync(d_tempB, h_B+m*slice*i, sizeof(dt)*m*slice, cudaMemcpyHostToDevice,0);
+        cudaStat4 = cudaDeviceSynchronize();
+        assert(cudaStat3 == cudaSuccess);
+        assert(cudaStat4 == cudaSuccess);
+        // printMatrix_Device(m, slice, d_tempB, m, "tempB");
+        f2h(d_tempB, d_Bh, m*slice);
+        cublas_status = cublasGemmEx(cublasH, CUBLAS_OP_T, CUBLAS_OP_N,
+                           ttrank, slice, m,
+                           &alpha, d_Ah, CUDA_R_16F, m,
+                           d_Bh, CUDA_R_16F, m,
+                           &beta0, d_tempATB, CUDA_R_32F, ttrank,
+                           CUDA_R_32F, algo);
+        assert(cublas_status == CUBLAS_STATUS_SUCCESS);
+
+        cudaStat3 = cudaMemcpyAsync(h_ATB+ttrank*slice*i, d_tempATB, sizeof(dt)*ttrank*slice, cudaMemcpyDeviceToHost, 0);
+        cudaStat4 = cudaDeviceSynchronize();
+        assert(cudaStat3 == cudaSuccess);
+        assert(cudaStat4 == cudaSuccess);
+    }
+    if(d_Ah     ) cudaFree(d_Ah); d_Ah=NULL;
+    if(d_Bh     ) cudaFree(d_Bh); d_Bh=NULL;
+    if(d_tempB  ) cudaFree(d_tempB); d_tempB=NULL;
+    if(d_tempATB  ) cudaFree(d_tempATB); d_tempATB=NULL;
+}
+
+
+
+void longMatrixSVD_Eign_once_host(cublasHandle_t cublasH, cusolverDnHandle_t cusolverH, dt *h_A, const int &m, const long long &n, const int &ttRank, dt *h_G, dt *h_A2, const int &p){
+    dt *d_W=NULL, *d_AAT=NULL,*d_G=NULL;
+    cudaStat1 = cudaMalloc((void**)&d_AAT, sizeof(dt)*m*m);
+    cudaStat2 = cudaMalloc((void**)&d_W, sizeof(dt)*m);
+    cudaStat3 = cudaMalloc((void**)&d_G, sizeof(dt)*m*ttRank);
+
+    GPUTimer timer0;
+    timer0.start();
+    // printf("selfMtrixMul\n");
+    // printMatrix_Device( m, n, d_A, m, "A");
+    largeMatrixSelfMulti_slice_host(cublasH, h_A, m, n, d_AAT, p);
+    printf("largeMatrixSelfMulti_slice_host time： %f\n", timer0.seconds());
+
+    // printMatrix_Device( m, m, d_AAT, m, "AAT");
+    // printf("basicEig\n");
+    GPUTimer timer1;
+    timer1.start();
+    basicEig(cusolverH, d_AAT, m, d_W);
+    printf("basicEig time： %f\n", timer1.seconds());
+
+     // printMatrix_Device( m, m, d_AAT, m, "AAT");
+    if(d_W     ) cudaFree(d_W); d_W = NULL;
+    // printf("matrixInvertColumn\n");
+    GPUTimer timer2;
+    timer2.start();
+    matrixInvertColumn(d_AAT, d_G, m, ttRank);
+    printf("matrixInvertColumn time： %f\n", timer2.seconds());
+    if(d_AAT    ) cudaFree(d_AAT);d_AAT=NULL;
+    // printMatrix_Device( 10,10, d_G1, 10, "G1");
+    // 大于24需要分片
+
+    GPUTimer timer3;
+    timer3.start();
+    // printf("smallargeMatrixMulti_slice_host_Tans\n");
+    smallargeMatrixMulti_slice_host_Tans(cublasH, d_G, h_A, ttRank, m, n, h_A2, p);
+    printf("smallargeMatrixMulti_slice_host_Tans time： %f\n", timer3.seconds());
+    // printMatrix_Device(10, 10, d_A2, 10, "A2");
+    cudaStat1 = cudaMemcpyAsync(h_G, d_G, sizeof(dt)*m*ttRank, cudaMemcpyDeviceToHost,0);
+    assert(cudaStat1 == cudaSuccess);
+    if(d_G) cudaFree(d_G);d_G=NULL;
+    // printMatrix_Device(10, 10, d_A2, 10, "A2");
+}
+
+
+float trdec_half_lu_device_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDemns, const int &calculateTimes, const int &p, bool calError){
     printf("Start mul \n");
     GPUTimer timer;
     timer.start(); 
-
+    float timeTransfer = 0.0;
     for(int i=0;i<calculateTimes;i++){
-        // printf("***************************** %d ********************************\n", i);
-///TODO 改成多GPU的逻辑 
-    //1
-        // GPUTimer timer0;
-        // timer0.start();
+        printf("***************************** %d ********************************\n", i);
 
         int m = ttDemns[0];
         int n = ttDemns[1]*ttDemns[2]*ttDemns[3]*ttDemns[4]*ttDemns[5];
         int n_half = n/2;
         dt alpha = 1.0, beta = 1.0;
         // printMatrix(m,n,h_A,m,"A"); 
-        dt *d_A1=NULL, *d_AAT1=NULL, *d_A21=NULL, *d_G11=NULL;
+        dt *d_A1=NULL, *d_AAT1=NULL, *d_A21=NULL, *d_G11=NULL, *d_A2_mid=NULL;
         dt *d_A0=NULL, *d_AAT0=NULL, *d_A2=NULL, *d_G10=NULL;
         dt *d_AAT=NULL, *h_G1=NULL;
 
@@ -469,11 +693,12 @@ float ttdec_half_lu_device_6_multiGPU(dt* h_A, const int *ttRanks, const int *tt
 
         cudaStat1 = cudaMalloc((void**)&d_A1, sizeof(dt)*m*n_half);
         cudaStat2 = cudaMalloc((void**)&d_AAT1, sizeof(dt)*m*m);
-        cudaStat3 = cudaMalloc((void**)&d_A21, sizeof(dt)*ttRanks[1]*n_half);
-        cudaStat4 = cudaMalloc((void**)&d_G11, sizeof(dt)*m*ttRanks[1]);
+        cudaStat3 = cudaMalloc((void**)&d_A21, sizeof(dt)*ttRanks[1]*n_half*ttRanks[0]);
+        cudaStat4 = cudaMalloc((void**)&d_G11, sizeof(dt)*m*ttRanks[1]*ttRanks[0]);
         assert(cudaStat1 == cudaSuccess);
         assert(cudaStat2 == cudaSuccess);
-        // assert(cudaStat3 == cudaSuccess);
+        assert(cudaStat3 == cudaSuccess);
+        assert(cudaStat4 == cudaSuccess);
 
         cudaSetDevice(0);
         cublas_status = cublasCreate(&cublasH);
@@ -484,7 +709,8 @@ float ttdec_half_lu_device_6_multiGPU(dt* h_A, const int *ttRanks, const int *tt
         cudaStat1 = cudaMalloc((void**)&d_A0, sizeof(dt)*m*n_half);
         cudaStat2 = cudaMalloc((void**)&d_AAT0, sizeof(dt)*m*m);
         cudaStat3 = cudaMalloc((void**)&d_AAT, sizeof(dt)*m*m);
-        cudaStat4 = cudaMalloc((void**)&d_A2, sizeof(dt)*n*ttRanks[1]);
+        cudaStat4 = cudaMalloc((void**)&d_A2, sizeof(dt)*n*ttRanks[1]*ttRanks[6]);
+        cudaStat4 = cudaMalloc((void**)&d_A2_mid, sizeof(dt)*n*ttRanks[1]*ttRanks[6]);
         assert(cudaStat1 == cudaSuccess);
         assert(cudaStat2 == cudaSuccess);
         assert(cudaStat3 == cudaSuccess);
@@ -516,14 +742,8 @@ float ttdec_half_lu_device_6_multiGPU(dt* h_A, const int *ttRanks, const int *tt
 
         cudaSetDevice(0);
         cudaStat1 = cudaMemcpyPeer(d_AAT, 0, d_AAT1, 1, sizeof(dt)*m*m);
-        // cudaStat2 = cudaMemcpyPeer(d_A0+m*n_half, 0, d_A1, 1, sizeof(dt)*m*n_half);
         assert(cudaStat1 == cudaSuccess);
-        // assert(cudaStat2 == cudaSuccess);
 
-        // printMatrix_Device(m,n,d_A0,m,"A0");
-        // printMatrix_Device(m,m,d_AAT1,m,"AAT1");
-        // printMatrix_Device(m,m,d_AAT0,m,"AAT0");
-        // printMatrix_Device(m,m,d_AAT,m,"AAT");
         cublas_status = cublasSgeam(cublasH, CUBLAS_OP_N, CUBLAS_OP_N, m, m, 
                           &alpha, d_AAT0, m,
                           &beta, d_AAT, m, d_AAT, m);
@@ -533,23 +753,18 @@ float ttdec_half_lu_device_6_multiGPU(dt* h_A, const int *ttRanks, const int *tt
         cusolver_status = cusolverDnCreate(&cusolverH);
         assert(CUSOLVER_STATUS_SUCCESS == cusolver_status);
 
-        cudaStat1 = cudaHostAlloc((void**)&h_G1,sizeof(dt)*m*ttRanks[1],0);
-        cudaStat2 = cudaMalloc((void**)&d_G10, sizeof(dt)*m*ttRanks[1]);
+        cudaStat1 = cudaHostAlloc((void**)&h_G1,sizeof(dt)*m*ttRanks[1]*ttRanks[0],0);
+        cudaStat2 = cudaMalloc((void**)&d_G10, sizeof(dt)*m*ttRanks[1]*ttRanks[0]);
         assert(cudaStat1 == cudaSuccess);
         assert(cudaStat2 == cudaSuccess);
-        // assert(cudaStat3 == cudaSuccess);
 
         dt *d_W=NULL;
         cudaStat2 = cudaMalloc((void**)&d_W, sizeof(dt)*m);
         
         basicEig(cusolverH, d_AAT, m, d_W);
-        // printf("basicEig Finish\n");
         if(d_W     ) cudaFree(d_W); d_W = NULL;
 
-        // printf("matrixInvertColumn\n");
-        // GPUTimer timer2;
-        // timer2.start();
-        matrixInvertColumn(d_AAT, d_G10, m, ttRanks[1]);
+        matrixInvertColumn(d_AAT, d_G10, m, ttRanks[1]*ttRanks[0]);
 
         // printMatrix_Device(m,ttRanks[1],d_G10,m,"G10");
 
@@ -557,16 +772,11 @@ float ttdec_half_lu_device_6_multiGPU(dt* h_A, const int *ttRanks, const int *tt
         if(d_AAT0     ) cudaFree(d_AAT0); d_AAT0 = NULL;
         if(d_AAT     ) cudaFree(d_AAT); d_AAT = NULL;
 
-        cudaStat5 = cudaMemcpyAsync(h_G1, d_G10, sizeof(dt)*m*ttRanks[1], cudaMemcpyDeviceToHost,0);
+        cudaStat5 = cudaMemcpyAsync(h_G1, d_G10, sizeof(dt)*m*ttRanks[1]*ttRanks[0], cudaMemcpyDeviceToHost,0);
         assert(cudaStat5 == cudaSuccess);
 
-        // 大于24需要分片 
-        // GPUTimer timer3;
-        // timer3.start();
-
-        cudaStat2 = cudaMemcpyPeer(d_G11, 1, d_G10, 0, sizeof(dt)*m*ttRanks[1]);
+        cudaStat2 = cudaMemcpyPeer(d_G11, 1, d_G10, 0, sizeof(dt)*m*ttRanks[1]*ttRanks[0]);
         assert(cudaStat2 == cudaSuccess);
-        // printMatrix_Device(m,ttRanks[1],d_G11,m,"G11");
 
 
 #pragma omp parallel num_threads(2)
@@ -578,12 +788,12 @@ float ttdec_half_lu_device_6_multiGPU(dt* h_A, const int *ttRanks, const int *tt
 
                 if(m>24 && n>pow(m,4)){
                     // printf("smallargeMatrixMulti_slice_device\n");
-                    smallargeMatrixMulti_slice_device(cublasH1, d_G11, d_A1, ttRanks[1], m, n_half, d_A21, p);
+                    smallargeMatrixMulti_slice_device(cublasH1, d_G11, d_A1, ttRanks[1]*ttRanks[0], m, n_half, d_A21, p);
                     // printMatrix_Device(10, 10, d_A2, 10, "A2");
                 }
                 else{
                     // printf("smallargeMatrixMulti_once_device\n");
-                    smallargeMatrixMulti_once_device(cublasH1, d_G11, d_A1, ttRanks[1], m, n_half, d_A21);
+                    smallargeMatrixMulti_once_device(cublasH1, d_G11, d_A1, ttRanks[1]*ttRanks[0], m, n_half, d_A21);
                 }            
             }
             else if(cpuid == 0)
@@ -592,21 +802,36 @@ float ttdec_half_lu_device_6_multiGPU(dt* h_A, const int *ttRanks, const int *tt
 
                 if(m>24 && n>pow(m,4)){
                     // printf("smallargeMatrixMulti_slice_device\n");
-                    smallargeMatrixMulti_slice_device(cublasH, d_G10, d_A0, ttRanks[1], m, n_half, d_A2, p);
+                    smallargeMatrixMulti_slice_device(cublasH, d_G10, d_A0, ttRanks[1]*ttRanks[0], m, n_half, d_A2_mid, p);
                         // printMatrix_Device(10, 10, d_A2, 10, "A2");
                 }
                 else{
                         // printf("smallargeMatrixMulti_once_device\n");
-                    smallargeMatrixMulti_once_device(cublasH, d_G10, d_A0, ttRanks[1], m, n_half, d_A2);
+                    smallargeMatrixMulti_once_device(cublasH, d_G10, d_A0, ttRanks[1]*ttRanks[0], m, n_half, d_A2_mid);
                 }
             }
         }
         cudaStat1 = cudaDeviceSynchronize();
         assert(cudaStat1 == cudaSuccess);
         cudaSetDevice(0);
-        cudaStat1 = cudaMemcpyPeer(d_A2+n_half*ttRanks[1], 0, d_A21, 1, sizeof(dt)*n_half*ttRanks[1]);
+        cudaStat1 = cudaMemcpyPeer(d_A2_mid+n_half*ttRanks[1]*ttRanks[0], 0, d_A21, 1, sizeof(dt)*n_half*ttRanks[1]*ttRanks[0]);
         assert(cudaStat1 == cudaSuccess);
-        // printMatrix_Device(ttRanks[1],n,d_A2,ttRanks[1],"A2");
+        // printMatrix_Device(ttRanks[1],n,d_A2,ttRanks[1],"A2")
+
+        cudaStat1 = cudaMalloc((void**)&d_A2, sizeof(dt)*n*ttRanks[1]*ttRanks[0]);
+        assert(cudaStat1 == cudaSuccess);
+
+        GPUTimer timer0;
+        timer0.start();
+        dim3 threads(1024,1,1);
+        dim3 blocksr1r2n((ttRanks[6]*ttRanks[1]*n+1024-1)/1024,1,1);
+        tensorToMode231<<<blocksr1r2n, threads>>>(d_A2_mid, d_A2, ttRanks[6], ttRanks[1], n);
+        // printMatrix_Device(ttRanks[1]*ttRanks[6], n, d_A2temp, ttRanks[1]*ttRanks[6], "A2temp");
+        cudaStat1 = cudaDeviceSynchronize();
+        if(d_A2_mid     ) cudaFree(d_A2_mid); d_A2_mid = NULL;
+        assert(cudaStat1 == cudaSuccess);
+        timeTransfer += timer0.seconds();
+
 
         if(d_A0      ) cudaFree(d_A0); d_A0 = NULL;
         if(d_A1      ) cudaFree(d_A1); d_A1 = NULL;
@@ -620,7 +845,7 @@ float ttdec_half_lu_device_6_multiGPU(dt* h_A, const int *ttRanks, const int *tt
         // timer1.start();
         dt *d_G2=NULL, *d_A3=NULL, *h_G2=NULL;
         m = ttRanks[1] * ttDemns[1]; //4
-        n = n/ttDemns[1]; //16
+        n = n/ttDemns[1] *ttRanks[6]; //16
         cudaStat1 = cudaMalloc((void**)&d_G2, sizeof(dt)*m*ttRanks[2]);
         cudaStat2 = cudaHostAlloc((void**)&h_G2,sizeof(dt)*m*ttRanks[2],0);
         cudaStat2 = cudaMalloc((void**)&d_A3, sizeof(dt)*n*ttRanks[2]);
@@ -678,18 +903,10 @@ float ttdec_half_lu_device_6_multiGPU(dt* h_A, const int *ttRanks, const int *tt
         cudaStat2 = cudaMalloc((void**)&d_A5, sizeof(dt)*ttRanks[4]*n);
         assert(cudaStat1 == cudaSuccess);
         assert(cudaStat2 == cudaSuccess);
-        // printMatrix_Device(10, 10, d_A4, 10, "A42");
-        // printMatrix_Device(m, n, d_A4, m, "A42");
         longMatrixSVD_Eign_once_device(cublasH, cusolverH, d_A4, m, n, ttRanks[4] , d_G4, d_A5, p);
-        // printMatrix_Device(10, 10, d_G4, 10, "G4");
-        // printMatrix_Device(10, 10, d_A5, 10, "A5");
-        // printMatrix_Device(m, ttRanks[4], d_G4, m, "G4");
-        // printMatrix_Device(ttRanks[4], n, d_A5, ttRanks[4], "A5");
         if(d_A4     ) cudaFree(d_A4); d_A4 = NULL;
         cudaStat5 = cudaMemcpyAsync(h_G4, d_G4, sizeof(dt)*m*ttRanks[4], cudaMemcpyDeviceToHost,0);
-        // cudaStat6 = cudaDeviceSynchronize();
         assert(cudaStat5 == cudaSuccess);
-        // assert(cudaStat6 == cudaSuccess);
         if(d_G4     ) cudaFree(d_G4); d_G4 = NULL;
         // printf(" forth time： %f\n\n", timer3.seconds());
 
@@ -705,13 +922,7 @@ float ttdec_half_lu_device_6_multiGPU(dt* h_A, const int *ttRanks, const int *tt
         cudaStat2 = cudaHostAlloc((void**)&h_G6,sizeof(dt)*n*ttRanks[5],0);
         assert(cudaStat1 == cudaSuccess);
         assert(cudaStat2 == cudaSuccess);
-        // printMatrix_Device(10, 10, d_A5, 10, "A52");
-        // printMatrix_Device(m, n, d_A5, m, "A52");
         longMatrixSVD_Eign_once_device(cublasH, cusolverH, d_A5, m, n, ttRanks[5] , d_G5, d_G6, p);
-        // printMatrix_Device(10, 10, d_G5, 10, "G5");
-        // printMatrix_Device(10, 10, d_G6, 10, "G6");
-        // printMatrix_Device(m, ttRanks[5], d_G5, m, "G5");
-        // printMatrix_Device(ttRanks[5], n, d_G6, ttRanks[5], "A6");
         if(d_A5     ) cudaFree(d_A5); d_A5 = NULL;
         cudaStat5 = cudaMemcpyAsync(h_G5, d_G5, sizeof(dt)*m*ttRanks[5], cudaMemcpyDeviceToHost,0);
         cudaStat6 = cudaMemcpyAsync(h_G6, d_G6, sizeof(dt)*n*ttRanks[5], cudaMemcpyDeviceToHost,0);
@@ -720,7 +931,6 @@ float ttdec_half_lu_device_6_multiGPU(dt* h_A, const int *ttRanks, const int *tt
         assert(cudaStat6 == cudaSuccess);
         if(d_G5     ) cudaFree(d_G5); d_G5 = NULL;
         if(d_G6     ) cudaFree(d_G6); d_G6 = NULL;
-        // printf(" fifth time： %f\n\n", timer4.seconds());
 
         if(calError){
             // printMatrix(10,10,h_A,10,"hA");
@@ -741,239 +951,95 @@ float ttdec_half_lu_device_6_multiGPU(dt* h_A, const int *ttRanks, const int *tt
     return time;
 }
 
-// , const long long &over, const long long &m,const long long &n, 
-// 实现一个超大规模矩阵A的 A*AT，存储到GPU上
-void largeMatrixSelfMulti_slice_host(cublasHandle_t cublasH, dt *h_A, const long long &over, const long long &m, const long long &n, dt *d_AAT, const int &p, const int & streamNumber){
-    long long slice = 0, le = 0;
-
-    if(n%p==0){
-        // printf("n chuyi p is 0, and threads:%d \n", omp_get_thread_num());
-        slice = n/p;
-    }else{
-        slice = n/p;
-        le = n%p;
-    }
-
-    float *d_tempA =NULL; 
-    half *d_Ah = NULL;
-    cudaStat1 = cudaMalloc((void**)&d_tempA, sizeof(dt)*m*slice);
-    cudaStat2 = cudaMalloc((void**)&d_Ah, sizeof(half)*m*slice);
-    assert(cudaStat1 == cudaSuccess);
-    assert(cudaStat2 == cudaSuccess);
-    // printf("slice is %lld\n", slice);
-
-    for(long long i=0;i<p;i++){
-        ///有问题需要修改
-        long long overTemp = over+m*slice*i;
-
-        cudaStat3 = cudaMemcpy(d_tempA, h_A+overTemp, sizeof(dt)*m*slice, cudaMemcpyHostToDevice);
-
-        if (cudaStat3 != cudaSuccess){
-            printf("over: %lld, m: %lld, slice: %lld, i: %lld", over, m, slice, i);
-
-            printf("530 error %d, overTemp: %lld , slice: %lld , i : %lld, m : %lld , n : %lld , p : %d, deviceid : %d\n", cudaStat3, overTemp, slice, i, m, n, p, streamNumber);
-        }
-        assert(cudaStat3 == cudaSuccess);
-        // assert(cudaStat4 == cudaSuccess);
-        //判断是否降维
-        f2h(d_tempA, d_Ah, m*slice);
-        cublas_status = cublasGemmEx(cublasH, CUBLAS_OP_N, CUBLAS_OP_T,
-                           m, m, slice,
-                           &alpha, d_Ah, CUDA_R_16F, m,
-                           d_Ah, CUDA_R_16F, m,
-                           &beta0, d_AAT, CUDA_R_32F, m,
-                           CUDA_R_32F, algo);
-        assert(cublas_status == CUBLAS_STATUS_SUCCESS);
-    }
-    if(d_Ah     ) cudaFree(d_Ah); d_Ah=NULL;
-    if(d_tempA  ) cudaFree(d_tempA); d_tempA=NULL;
-}
 
 
-void smallargeMatrixMulti_slice_host_Tans(cublasHandle_t cublasH, dt *d_A, dt *h_B, const int &ttrank, const long long &m,  const long long &n, dt *h_ATB, const int &p){
-    long long slice = 0;
-    if(n%p==0)
-        slice = n/p;
-    else
-        assert("P is not slice");
-    // printf("ttrank: %d, n: %d",m,ttrank,n);
-    float *d_tempB = NULL, *d_tempATB = NULL; 
-    half *d_Ah = NULL, *d_Bh = NULL;
-    cudaStat1 = cudaMalloc((void**)&d_tempB, sizeof(dt)*m*slice);
-    cudaStat2 = cudaMalloc((void**)&d_tempATB, sizeof(dt)*ttrank*slice);
-    cudaStat3 = cudaMalloc((void**)&d_Ah, sizeof(half)*m*ttrank);
-    cudaStat4 = cudaMalloc((void**)&d_Bh, sizeof(half)*m*slice);
-    assert(cudaStat1 == cudaSuccess);
-    assert(cudaStat2 == cudaSuccess);
-    assert(cudaStat3 == cudaSuccess);
-    assert(cudaStat4 == cudaSuccess);
-
-    // printMatrix_Device(m, ttrank, d_A, m, "tempA");
-    f2h(d_A, d_Ah, m*ttrank);
-    // printf("%d\n", slice);
-    for(long long i=0;i<p;i++){
-        cudaStat3 = cudaMemcpyAsync(d_tempB, h_B+m*slice*i, sizeof(dt)*m*slice, cudaMemcpyHostToDevice,0);
-        cudaStat4 = cudaDeviceSynchronize();
-        assert(cudaStat3 == cudaSuccess);
-        assert(cudaStat4 == cudaSuccess);
-        f2h(d_tempB, d_Bh, m*slice);
-        cublas_status = cublasGemmEx(cublasH, CUBLAS_OP_T, CUBLAS_OP_N,
-                           ttrank, slice, m,
-                           &alpha, d_Ah, CUDA_R_16F, m,
-                           d_Bh, CUDA_R_16F, m,
-                           &beta0, d_tempATB, CUDA_R_32F, ttrank,
-                           CUDA_R_32F, algo);
-        assert(cublas_status == CUBLAS_STATUS_SUCCESS);
-        // printMatrix_Device(ttrank, slice, d_tempATB, ttrank, "tempATB");
-
-        cudaStat3 = cudaMemcpyAsync(h_ATB+ttrank*slice*i, d_tempATB, sizeof(dt)*ttrank*slice, cudaMemcpyDeviceToHost, 0);
-        cudaStat4 = cudaDeviceSynchronize();
-        assert(cudaStat3 == cudaSuccess);
-        assert(cudaStat4 == cudaSuccess);
-    }
-    if(d_Ah     ) cudaFree(d_Ah); d_Ah=NULL;
-    if(d_Bh     ) cudaFree(d_Bh); d_Bh=NULL;
-    if(d_tempB  ) cudaFree(d_tempB); d_tempB=NULL;
-    if(d_tempATB  ) cudaFree(d_tempATB); d_tempATB=NULL;
-}
-
-
-void multi_gpu_single_order_decomposition(){
-    
-}
-
-
-float ttdec_half_lu_host_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDemns, const int &calculateTimes, const int &p, bool calError){
+float trdec_half_lu_host_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDemns, const int &calculateTimes, const int &p, bool calError){
     printf("Start mul \n");
     GPUTimer timer;
     timer.start(); 
-    int device[8] = {0,1,2,3,4,5,6,7};
+    float timeTransfer = 0.0;
+    int device[4] = {0,1,4,5};
     for(int i=0;i<calculateTimes;i++){
-        cudaSetDevice(device[0]);
         printf("***************************** %d ********************************\n", i);
+///TODO 改成多GPU的逻辑 
     //1
         int m = ttDemns[0];
         int n = ttDemns[1]*ttDemns[2]*ttDemns[3]*ttDemns[4]*ttDemns[5];
-        int n_half = n/8;
+        int n_half = n/4;
         printf("n_half: %d", n_half);
         dt alpha = 1.0, beta = 1.0;
         // printMatrix(m,n,h_A,m,"A"); 
-        dt *d_AAT0=NULL, *d_A2=NULL, *d_G10=NULL;
-        dt *d_AAT1=NULL, *d_A21=NULL, *d_G11=NULL;
-        dt *d_AAT2=NULL, *d_A22=NULL, *d_G12=NULL;
         dt *d_AAT3=NULL, *d_A23=NULL, *d_G13=NULL;
-        dt *d_AAT4=NULL, *d_A24=NULL, *d_G14=NULL;
-        dt *d_AAT5=NULL, *d_A25=NULL, *d_G15=NULL;
-        dt *d_AAT6=NULL, *d_A26=NULL, *d_G16=NULL;
-        dt *d_AAT7=NULL, *d_A27=NULL, *d_G17=NULL;
+        dt *d_AAT2=NULL, *d_A22=NULL, *d_G12=NULL;
+        dt *d_AAT1=NULL, *d_A21=NULL, *d_G11=NULL;
+        dt *d_AAT0=NULL, *d_A2=NULL, *d_G10=NULL;
         dt *d_AAT=NULL, *h_G1=NULL;
 
-        cublasHandle_t cublasH = NULL;
-        cublasHandle_t cublasH1 = NULL;
-        cublasHandle_t cublasH2 = NULL;
         cublasHandle_t cublasH3 = NULL;
-        cublasHandle_t cublasH4 = NULL;
-        cublasHandle_t cublasH5 = NULL;
-        cublasHandle_t cublasH6 = NULL;
-        cublasHandle_t cublasH7 = NULL;
+        cublasHandle_t cublasH2 = NULL;
+        cublasHandle_t cublasH1 = NULL;
+        cublasHandle_t cublasH = NULL;
         cusolverDnHandle_t cusolverH = NULL;
 
-#pragma omp parallel num_threads(8)
+        cudaSetDevice(device[3]);
+        cublas_status = cublasCreate(&cublasH3);
+        assert(CUBLAS_STATUS_SUCCESS == cublas_status);
+        cublas_status = cublasSetMathMode(cublasH3, mathMode);
+        assert(CUBLAS_STATUS_SUCCESS == cublas_status);
+
+        cudaStat2 = cudaMalloc((void**)&d_AAT3, sizeof(dt)*m*m);
+        cudaStat3 = cudaMalloc((void**)&d_A23, sizeof(dt)*ttRanks[1]*ttRanks[0]*n_half);
+        cudaStat4 = cudaMalloc((void**)&d_G13, sizeof(dt)*m*ttRanks[1]*ttRanks[0]);
+        assert(cudaStat2 == cudaSuccess);
+        assert(cudaStat3 == cudaSuccess);
+        assert(cudaStat4 == cudaSuccess);
+
+        cudaSetDevice(device[2]);
+        cublas_status = cublasCreate(&cublasH2);
+        assert(CUBLAS_STATUS_SUCCESS == cublas_status);
+        cublas_status = cublasSetMathMode(cublasH2, mathMode);
+        assert(CUBLAS_STATUS_SUCCESS == cublas_status);
+
+        cudaStat2 = cudaMalloc((void**)&d_AAT2, sizeof(dt)*m*m);
+        cudaStat3 = cudaMalloc((void**)&d_A22, sizeof(dt)*ttRanks[1]*ttRanks[0]*n_half);
+        cudaStat4 = cudaMalloc((void**)&d_G12, sizeof(dt)*m*ttRanks[1]*ttRanks[0]);
+        assert(cudaStat2 == cudaSuccess);
+        assert(cudaStat3 == cudaSuccess);
+        assert(cudaStat4 == cudaSuccess);
+
+        cudaSetDevice(device[1]);
+        cublas_status = cublasCreate(&cublasH1);
+        assert(CUBLAS_STATUS_SUCCESS == cublas_status);
+        cublas_status = cublasSetMathMode(cublasH1, mathMode);
+        assert(CUBLAS_STATUS_SUCCESS == cublas_status);
+
+        cudaStat2 = cudaMalloc((void**)&d_AAT1, sizeof(dt)*m*m);
+        cudaStat3 = cudaMalloc((void**)&d_A21, sizeof(dt)*ttRanks[1]*ttRanks[0]*n_half);
+        cudaStat4 = cudaMalloc((void**)&d_G11, sizeof(dt)*m*ttRanks[1]*ttRanks[0]);
+        assert(cudaStat2 == cudaSuccess);
+        assert(cudaStat3 == cudaSuccess);
+        assert(cudaStat4 == cudaSuccess);
+
+        cudaSetDevice(device[0]);
+        cublas_status = cublasCreate(&cublasH);
+        assert(CUBLAS_STATUS_SUCCESS == cublas_status);
+        cublas_status = cublasSetMathMode(cublasH, mathMode);
+        assert(CUBLAS_STATUS_SUCCESS == cublas_status);
+
+        cudaStat2 = cudaMalloc((void**)&d_AAT0, sizeof(dt)*m*m);
+        cudaStat3 = cudaMalloc((void**)&d_AAT, sizeof(dt)*m*m);
+        cudaStat4 = cudaMalloc((void**)&d_A2, sizeof(dt)*n*ttRanks[1]*ttRanks[0]);
+        cudaStat4 = cudaMalloc((void**)&d_A2_mid, sizeof(dt)*n*ttRanks[1]*ttRanks[0]);
+        assert(cudaStat2 == cudaSuccess);
+        assert(cudaStat3 == cudaSuccess);
+        assert(cudaStat4 == cudaSuccess);
+        
+#pragma omp parallel num_threads(4)
         {
             int cpuid = omp_get_thread_num();
-            if(cpuid == 7)
-            {   
-                cudaSetDevice(device[7]);
-                cublas_status = cublasCreate(&cublasH7);
-                assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-                cublas_status = cublasSetMathMode(cublasH7, mathMode);
-                assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-
-                cudaStat1 = cudaMalloc((void**)&d_AAT7, sizeof(dt)*m*m);
-                cudaStat2 = cudaMalloc((void**)&d_A27, sizeof(dt)*ttRanks[1]*n_half);
-                cudaStat3 = cudaMalloc((void**)&d_G17, sizeof(dt)*m*ttRanks[1]);
-                assert(cudaStat1 == cudaSuccess);
-                assert(cudaStat2 == cudaSuccess);
-                assert(cudaStat3 == cudaSuccess);
-                cudaDeviceEnablePeerAccess(0,0);
-                long long over1 = ((long long)m)*n_half*(long long)7;
-                largeMatrixSelfMulti_slice_host(cublasH7, h_A, over1, (long long)m, n_half, d_AAT7, p, device[7]);
-                printf("thread 7 finish\n");
-            }
-            else if(cpuid == 6)
-            {   
-                cudaSetDevice(device[6]);
-                cublas_status = cublasCreate(&cublasH6);
-                assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-                cublas_status = cublasSetMathMode(cublasH6, mathMode);
-                assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-
-                cudaStat2 = cudaMalloc((void**)&d_AAT6, sizeof(dt)*m*m);
-                cudaStat3 = cudaMalloc((void**)&d_A26, sizeof(dt)*ttRanks[1]*n_half);
-                cudaStat4 = cudaMalloc((void**)&d_G16, sizeof(dt)*m*ttRanks[1]);
-                assert(cudaStat1 == cudaSuccess);
-                assert(cudaStat2 == cudaSuccess);
-
-                cudaDeviceEnablePeerAccess(0,0);
-                long long over1 = ((long long)m)*n_half*(long long)6;
-                largeMatrixSelfMulti_slice_host(cublasH6, h_A, over1, (long long)m, n_half, d_AAT6, p, device[6]);
-                printf("thread 6 finish\n");
-            }
-            else if(cpuid == 5)
-            {   
-                cudaSetDevice(device[5]);
-                cublas_status = cublasCreate(&cublasH5);
-                assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-                cublas_status = cublasSetMathMode(cublasH5, mathMode);
-                assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-
-                cudaStat1 = cudaMalloc((void**)&d_AAT5, sizeof(dt)*m*m);
-                cudaStat2 = cudaMalloc((void**)&d_A25, sizeof(dt)*ttRanks[1]*n_half);
-                cudaStat3 = cudaMalloc((void**)&d_G15, sizeof(dt)*m*ttRanks[1]);
-                assert(cudaStat1 == cudaSuccess);
-                assert(cudaStat2 == cudaSuccess);
-                assert(cudaStat3 == cudaSuccess);
-
-                cudaDeviceEnablePeerAccess(0,0);
-                long long over1 = ((long long)m)*n_half*(long long)5;
-                largeMatrixSelfMulti_slice_host(cublasH5, h_A, over1, (long long)m, n_half, d_AAT5, p, device[5]);
-                printf("thread 5 finish\n");
-            }
-            else if(cpuid == 4)
-            {   
-                cudaSetDevice(device[4]);
-                cublas_status = cublasCreate(&cublasH4);
-                assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-                cublas_status = cublasSetMathMode(cublasH4, mathMode);
-                assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-
-                cudaStat1 = cudaMalloc((void**)&d_AAT4, sizeof(dt)*m*m);
-                cudaStat2 = cudaMalloc((void**)&d_A24, sizeof(dt)*ttRanks[1]*n_half);
-                cudaStat3 = cudaMalloc((void**)&d_G14, sizeof(dt)*m*ttRanks[1]);
-                assert(cudaStat1 == cudaSuccess);
-                assert(cudaStat2 == cudaSuccess);
-                assert(cudaStat3 == cudaSuccess);
-
-                cudaDeviceEnablePeerAccess(0,0);
-                long long over1 = ((long long)m)*n_half*(long long)4;
-                largeMatrixSelfMulti_slice_host(cublasH4, h_A, over1, (long long)m, n_half, d_AAT4, p, device[4]);
-                printf("thread 4 finish\n");
-            }
-            else if(cpuid == 3)
+            if(cpuid == 3)
             {   
                 cudaSetDevice(device[3]);
-                cublas_status = cublasCreate(&cublasH3);
-                assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-                cublas_status = cublasSetMathMode(cublasH3, mathMode);
-                assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-
-                cudaStat1 = cudaMalloc((void**)&d_AAT3, sizeof(dt)*m*m);
-                cudaStat2 = cudaMalloc((void**)&d_A23, sizeof(dt)*ttRanks[1]*n_half);
-                cudaStat3 = cudaMalloc((void**)&d_G13, sizeof(dt)*m*ttRanks[1]);
-                assert(cudaStat1 == cudaSuccess);
-                assert(cudaStat2 == cudaSuccess);
-                assert(cudaStat3 == cudaSuccess);
-
                 cudaDeviceEnablePeerAccess(0,0);
                 long long over1 = ((long long)m)*n_half*(long long)3;
                 largeMatrixSelfMulti_slice_host(cublasH3, h_A, over1, (long long)m, n_half, d_AAT3, p, device[3]);
@@ -982,18 +1048,6 @@ float ttdec_half_lu_host_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDe
             else if(cpuid == 2)
             {   
                 cudaSetDevice(device[2]);
-                cublas_status = cublasCreate(&cublasH2);
-                assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-                cublas_status = cublasSetMathMode(cublasH2, mathMode);
-                assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-
-                cudaStat1 = cudaMalloc((void**)&d_AAT2, sizeof(dt)*m*m);
-                cudaStat2 = cudaMalloc((void**)&d_A22, sizeof(dt)*ttRanks[1]*n_half);
-                cudaStat3 = cudaMalloc((void**)&d_G12, sizeof(dt)*m*ttRanks[1]);
-                assert(cudaStat1 == cudaSuccess);
-                assert(cudaStat2 == cudaSuccess);
-                assert(cudaStat3 == cudaSuccess);
-
                 cudaDeviceEnablePeerAccess(0,0);
                 long long over1 = ((long long)m)*n_half*(long long)2;
                 largeMatrixSelfMulti_slice_host(cublasH2, h_A, over1, (long long)m, n_half, d_AAT2, p, device[2]);
@@ -1002,18 +1056,6 @@ float ttdec_half_lu_host_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDe
             else if(cpuid == 1)
             {   
                 cudaSetDevice(device[1]);
-                cublas_status = cublasCreate(&cublasH1);
-                assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-                cublas_status = cublasSetMathMode(cublasH1, mathMode);
-                assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-
-                cudaStat1 = cudaMalloc((void**)&d_AAT1, sizeof(dt)*m*m);
-                cudaStat2 = cudaMalloc((void**)&d_A21, sizeof(dt)*ttRanks[1]*n_half);
-                cudaStat2 = cudaMalloc((void**)&d_G11, sizeof(dt)*m*ttRanks[1]);
-                assert(cudaStat1 == cudaSuccess);
-                assert(cudaStat2 == cudaSuccess);
-                assert(cudaStat3 == cudaSuccess);
-
                 cudaDeviceEnablePeerAccess(0,0);
                 long long over1 = ((long long)m)*n_half*(long long)1;
                 largeMatrixSelfMulti_slice_host(cublasH1, h_A, over1, (long long)m, n_half, d_AAT1, p, device[1]);
@@ -1022,18 +1064,6 @@ float ttdec_half_lu_host_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDe
             else if(cpuid == 0)
             {   
                 cudaSetDevice(device[0]);
-                cublas_status = cublasCreate(&cublasH);
-                assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-                cublas_status = cublasSetMathMode(cublasH, mathMode);
-                assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-
-                cudaStat1 = cudaMalloc((void**)&d_AAT0, sizeof(dt)*m*m);
-                cudaStat2 = cudaMalloc((void**)&d_AAT, sizeof(dt)*m*m);
-                cudaStat3 = cudaMalloc((void**)&d_A2, sizeof(dt)*n*ttRanks[1]);
-                assert(cudaStat1 == cudaSuccess);
-                assert(cudaStat2 == cudaSuccess);
-                assert(cudaStat3 == cudaSuccess);
-
                 cudaDeviceEnablePeerAccess(device[3],device[0]);
                 cudaDeviceEnablePeerAccess(device[2],device[0]);
                 cudaDeviceEnablePeerAccess(device[1],device[0]);
@@ -1052,6 +1082,7 @@ float ttdec_half_lu_host_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDe
         cublas_status = cublasSgeam(cublasH, CUBLAS_OP_N, CUBLAS_OP_N, m, m, 
                           &alpha, d_AAT0, m,
                           &beta, d_AAT, m, d_AAT, m);
+        // printMatrix_Device(m,m,d_AAT,m,"AAT");
         assert(CUBLAS_STATUS_SUCCESS == cublas_status);
 
         cudaStat1 = cudaMemcpyPeer(d_AAT0, device[0], d_AAT2, device[2], sizeof(dt)*m*m);
@@ -1060,6 +1091,7 @@ float ttdec_half_lu_host_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDe
         cublas_status = cublasSgeam(cublasH, CUBLAS_OP_N, CUBLAS_OP_N, m, m, 
                           &alpha, d_AAT0, m,
                           &beta, d_AAT, m, d_AAT, m);
+        // printMatrix_Device(m,m,d_AAT,m,"AAT");
         assert(CUBLAS_STATUS_SUCCESS == cublas_status);
 
         cudaStat1 = cudaMemcpyPeer(d_AAT0, device[0], d_AAT3, device[3], sizeof(dt)*m*m);
@@ -1070,45 +1102,12 @@ float ttdec_half_lu_host_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDe
                           &beta, d_AAT, m, d_AAT, m);
         assert(CUBLAS_STATUS_SUCCESS == cublas_status);
 
-        cudaStat1 = cudaMemcpyPeer(d_AAT0, device[0], d_AAT4, device[4], sizeof(dt)*m*m);
-        assert(cudaStat1 == cudaSuccess);
-
-        cublas_status = cublasSgeam(cublasH, CUBLAS_OP_N, CUBLAS_OP_N, m, m, 
-                          &alpha, d_AAT0, m,
-                          &beta, d_AAT, m, d_AAT, m);
-        assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-
-        cudaStat1 = cudaMemcpyPeer(d_AAT0, device[0], d_AAT5, device[5], sizeof(dt)*m*m);
-        assert(cudaStat1 == cudaSuccess);
-
-        cublas_status = cublasSgeam(cublasH, CUBLAS_OP_N, CUBLAS_OP_N, m, m, 
-                          &alpha, d_AAT0, m,
-                          &beta, d_AAT, m, d_AAT, m);
-        assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-
-        cudaStat1 = cudaMemcpyPeer(d_AAT0, device[0], d_AAT6, device[6], sizeof(dt)*m*m);
-        assert(cudaStat1 == cudaSuccess);
-
-        cublas_status = cublasSgeam(cublasH, CUBLAS_OP_N, CUBLAS_OP_N, m, m, 
-                          &alpha, d_AAT0, m,
-                          &beta, d_AAT, m, d_AAT, m);
-        assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-
-        cudaStat1 = cudaMemcpyPeer(d_AAT0, device[0], d_AAT7, device[7], sizeof(dt)*m*m);
-        assert(cudaStat1 == cudaSuccess);
-
-        cublas_status = cublasSgeam(cublasH, CUBLAS_OP_N, CUBLAS_OP_N, m, m, 
-                          &alpha, d_AAT0, m,
-                          &beta, d_AAT, m, d_AAT, m);
-        assert(CUBLAS_STATUS_SUCCESS == cublas_status);
-
-
         
         cusolver_status = cusolverDnCreate(&cusolverH);
         assert(CUSOLVER_STATUS_SUCCESS == cusolver_status);
 
-        cudaStat1 = cudaHostAlloc((void**)&h_G1,sizeof(dt)*m*ttRanks[1],0);
-        cudaStat2 = cudaMalloc((void**)&d_G10, sizeof(dt)*m*ttRanks[1]);
+        cudaStat1 = cudaHostAlloc((void**)&h_G1,sizeof(dt)*m*ttRanks[1]*ttRanks[0],0);
+        cudaStat2 = cudaMalloc((void**)&d_G10, sizeof(dt)*m*ttRanks[1]*ttRanks[0]);
         assert(cudaStat1 == cudaSuccess);
         assert(cudaStat2 == cudaSuccess);
 
@@ -1118,133 +1117,50 @@ float ttdec_half_lu_host_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDe
         basicEig(cusolverH, d_AAT, m, d_W);
         if(d_W     ) cudaFree(d_W); d_W = NULL;
 
-        matrixInvertColumn(d_AAT, d_G10, m, ttRanks[1]);
+        matrixInvertColumn(d_AAT, d_G10, m, ttRanks[1]*ttRanks[0]);
 
 
         if(d_AAT1      ) cudaFree(d_AAT1); d_AAT1 = NULL;
         if(d_AAT0     ) cudaFree(d_AAT0); d_AAT0 = NULL;
         if(d_AAT     ) cudaFree(d_AAT); d_AAT = NULL;
 
-        cudaStat5 = cudaMemcpyAsync(h_G1, d_G10, sizeof(dt)*m*ttRanks[1], cudaMemcpyDeviceToHost,0);
+        cudaStat5 = cudaMemcpyAsync(h_G1, d_G10, sizeof(dt)*m*ttRanks[1]*ttRanks[0], cudaMemcpyDeviceToHost,0);
         assert(cudaStat5 == cudaSuccess);
 
+        // 大于24需要分片 
 
-        #pragma omp parallel num_threads(8)
+        cudaStat2 = cudaMemcpyPeer(d_G11, device[1], d_G10, device[0], sizeof(dt)*m*ttRanks[1]*ttRanks[0]);
+        assert(cudaStat2 == cudaSuccess);
+        cudaStat2 = cudaMemcpyPeer(d_G12, device[2], d_G10, device[0], sizeof(dt)*m*ttRanks[1]*ttRanks[0]);
+        assert(cudaStat2 == cudaSuccess);
+        cudaStat2 = cudaMemcpyPeer(d_G13, device[3], d_G10, device[0], sizeof(dt)*m*ttRanks[1]*ttRanks[0]);
+        assert(cudaStat2 == cudaSuccess);
+
+        #pragma omp parallel num_threads(4)
         {
             int cpuid = omp_get_thread_num();
-            if(cpuid == 7)
-            {      
-                cudaSetDevice(device[7]);
-
-                cudaStat2 = cudaMemcpyPeer(d_G17, device[7], d_G10, device[0], sizeof(dt)*m*ttRanks[1]);
-                assert(cudaStat2 == cudaSuccess);
-
-                smallargeMatrixMulti_slice_host_Tans(cublasH7, d_G17, h_A+((long long)m)*n_half*(long long)7, ttRanks[1], m, n_half, d_A27, p);
-                printf("thread 6 finish0\n");
-                if(d_G17     ) cudaFree(d_G17); d_G17 = NULL;
-
-                cudaStat1 = cudaMemcpyPeer(d_A2+n_half*ttRanks[1]*(long long)7, device[0], d_A27, device[7], sizeof(dt)*n_half*ttRanks[1]);
-                assert(cudaStat1 == cudaSuccess);
-                if(d_A27     ) cudaFree(d_A27); d_A27 = NULL;
-            }
-            else if(cpuid == 6)
-            {      
-                cudaSetDevice(device[6]);
-
-                cudaStat2 = cudaMemcpyPeer(d_G16, device[6], d_G10, device[0], sizeof(dt)*m*ttRanks[1]);
-                assert(cudaStat2 == cudaSuccess);
-
-                smallargeMatrixMulti_slice_host_Tans(cublasH6, d_G16, h_A+((long long)m)*n_half*(long long)6, ttRanks[1], m, n_half, d_A26, p);
-                printf("thread 6 finish0\n");
-                if(d_G16     ) cudaFree(d_G16); d_G16 = NULL;
-
-                cudaStat1 = cudaMemcpyPeer(d_A2+n_half*ttRanks[1]*(long long)6, device[0], d_A26, device[6], sizeof(dt)*n_half*ttRanks[1]);
-                assert(cudaStat1 == cudaSuccess);
-                if(d_A26     ) cudaFree(d_A26); d_A26 = NULL;
-            }
-            else if(cpuid == 5)
-            {      
-                cudaSetDevice(device[5]);
-
-                cudaStat2 = cudaMemcpyPeer(d_G15, device[5], d_G10, device[0], sizeof(dt)*m*ttRanks[1]);
-                assert(cudaStat2 == cudaSuccess);
-
-                smallargeMatrixMulti_slice_host_Tans(cublasH5, d_G15, h_A+((long long)m)*n_half*(long long)5, ttRanks[1], m, n_half, d_A25, p);
-                printf("thread 3 finish0\n");
-                if(d_G15     ) cudaFree(d_G15); d_G15 = NULL;
-
-                cudaStat1 = cudaMemcpyPeer(d_A2+n_half*ttRanks[1]*(long long)5, device[0], d_A25, device[5], sizeof(dt)*n_half*ttRanks[1]);
-                assert(cudaStat1 == cudaSuccess);
-                if(d_A25     ) cudaFree(d_A25); d_A25 = NULL;
-            }
-            else if(cpuid == 4)
-            {      
-                cudaSetDevice(device[4]);
-
-                cudaStat2 = cudaMemcpyPeer(d_G14, device[4], d_G10, device[0], sizeof(dt)*m*ttRanks[1]);
-                assert(cudaStat2 == cudaSuccess);
-
-                smallargeMatrixMulti_slice_host_Tans(cublasH4, d_G14, h_A+((long long)m)*n_half*(long long)4, ttRanks[1], m, n_half, d_A24, p);
-                printf("thread 3 finish0\n");
-                if(d_G14     ) cudaFree(d_G14); d_G14 = NULL;
-
-                cudaStat1 = cudaMemcpyPeer(d_A2+n_half*ttRanks[1]*(long long)4, device[0], d_A24, device[4], sizeof(dt)*n_half*ttRanks[1]);
-                assert(cudaStat1 == cudaSuccess);
-                if(d_A24     ) cudaFree(d_A24); d_A24 = NULL;
-            }
-            else if(cpuid == 3)
+            if(cpuid == 3)
             {      
                 cudaSetDevice(device[3]);
-
-                cudaStat2 = cudaMemcpyPeer(d_G13, device[3], d_G10, device[0], sizeof(dt)*m*ttRanks[1]);
-                assert(cudaStat2 == cudaSuccess);
-
-                smallargeMatrixMulti_slice_host_Tans(cublasH3, d_G13, h_A+((long long)m)*n_half*(long long)3, ttRanks[1], m, n_half, d_A23, p);
+                smallargeMatrixMulti_slice_host_Tans(cublasH1, d_G13, h_A+((long long)m)*n_half*(long long)3, ttRanks[1]*ttRanks[0], m, n_half, d_A23, p);
                 printf("thread 3 finish0\n");
-                if(d_G13     ) cudaFree(d_G13); d_G13 = NULL;
-
-                cudaStat1 = cudaMemcpyPeer(d_A2+n_half*ttRanks[1]*(long long)3, device[0], d_A23, device[3], sizeof(dt)*n_half*ttRanks[1]);
-                assert(cudaStat1 == cudaSuccess);
-                if(d_A23     ) cudaFree(d_A23); d_A23 = NULL;
             }
             else if(cpuid == 2)
             {      
                 cudaSetDevice(device[2]);
-
-                cudaStat2 = cudaMemcpyPeer(d_G12, device[2], d_G10, device[0], sizeof(dt)*m*ttRanks[1]);
-                assert(cudaStat2 == cudaSuccess);
-
-                smallargeMatrixMulti_slice_host_Tans(cublasH2, d_G12, h_A+((long long)m)*n_half*(long long)2, ttRanks[1], m, n_half, d_A22, p);
+                smallargeMatrixMulti_slice_host_Tans(cublasH1, d_G12, h_A+((long long)m)*n_half*(long long)2, ttRanks[1]*ttRanks[0], m, n_half, d_A22, p);
                 printf("thread 2 finish0\n");
-                if(d_G12     ) cudaFree(d_G12); d_G12 = NULL;
-
-                cudaStat1 = cudaMemcpyPeer(d_A2+n_half*ttRanks[1]*(long long)2, device[0], d_A22, device[2], sizeof(dt)*n_half*ttRanks[1]);
-                assert(cudaStat1 == cudaSuccess);
-
-                if(d_A22     ) cudaFree(d_A22); d_A22 = NULL;
-
             }
             else if(cpuid == 1)
             {      
                 cudaSetDevice(device[1]);
-
-                cudaStat2 = cudaMemcpyPeer(d_G11, device[1], d_G10, device[0], sizeof(dt)*m*ttRanks[1]);
-                assert(cudaStat2 == cudaSuccess);
-
-                smallargeMatrixMulti_slice_host_Tans(cublasH1, d_G11, h_A+((long long)m)*n_half, ttRanks[1], m, n_half, d_A21, p);
+                smallargeMatrixMulti_slice_host_Tans(cublasH1, d_G11, h_A+((long long)m)*n_half, ttRanks[1]*ttRanks[0], m, n_half, d_A21, p);
                 printf("thread 1 finish0\n");
-                if(d_G11     ) cudaFree(d_G11); d_G11 = NULL;
-
-                cudaStat1 = cudaMemcpyPeer(d_A2+n_half*ttRanks[1], device[0], d_A21, device[1], sizeof(dt)*n_half*ttRanks[1]);
-                assert(cudaStat1 == cudaSuccess);
-
-                if(d_A21     ) cudaFree(d_A21); d_A21 = NULL;
-
             }
             else if(cpuid == 0)
             {   
                 cudaSetDevice(device[0]);
-                smallargeMatrixMulti_slice_host_Tans(cublasH, d_G10, h_A, ttRanks[1], m, n_half, d_A2, p);
+                smallargeMatrixMulti_slice_host_Tans(cublasH, d_G10, h_A, ttRanks[1]*ttRanks[0],, m, n_half, d_A2_mid, p);
                 printf("thread 0 finish0\n");
             }
         }
@@ -1252,20 +1168,44 @@ float ttdec_half_lu_host_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDe
         assert(cudaStat1 == cudaSuccess);
         cudaSetDevice(device[0]);
 
-        if(d_G10     ) cudaFree(d_G10); d_G10 = NULL;
+        cudaStat1 = cudaMemcpyPeer(d_A2_mid+n_half*ttRanks[1]*ttRanks[0], device[0], d_A21, device[1], sizeof(dt)*n_half*ttRanks[1]*ttRanks[0]);
+        assert(cudaStat1 == cudaSuccess);
+        cudaStat1 = cudaMemcpyPeer(d_A2_mid+n_half*ttRanks[1]*ttRanks[0]*(long long)2, device[0], d_A22, device[2], sizeof(dt)*n_half*ttRanks[1]*ttRanks[0]);
+        assert(cudaStat1 == cudaSuccess);
+        cudaStat1 = cudaMemcpyPeer(d_A2_mid+n_half*ttRanks[1]*ttRanks[0]*(long long)3, device[0], d_A23, device[3], sizeof(dt)*n_half*ttRanks[1]*ttRanks[0]);
+        assert(cudaStat1 == cudaSuccess);
 
+        GPUTimer timer0;
+        timer0.start();
+        dim3 threads(1024,1,1);
+        dim3 blocksr1r2n((ttRanks[6]*ttRanks[1]*n+1024-1)/1024,1,1);
+        tensorToMode231<<<blocksr1r2n, threads>>>(d_A2_mid, d_A2, ttRanks[6], ttRanks[1], n);
+        cudaStat1 = cudaDeviceSynchronize();
+        assert(cudaStat1 == cudaSuccess);
+        timeTransfer += timer0.seconds();
+
+
+        if(d_A23     ) cudaFree(d_A23); d_A23 = NULL;
+        if(d_A22     ) cudaFree(d_A22); d_A22 = NULL;
+
+        if(d_G12     ) cudaFree(d_G12); d_G12 = NULL;
+        if(d_G13     ) cudaFree(d_G13); d_G13 = NULL;
+
+        if(d_A21     ) cudaFree(d_A21); d_A21 = NULL;
+        if(d_A2_mid  ) cudaFree(d_A2_mid); d_A2_mid = NULL;
+        if(d_G10     ) cudaFree(d_G10); d_G10 = NULL;
+        if(d_G11     ) cudaFree(d_G11); d_G11 = NULL;
 
     //1->2
-        // GPUTimer timer1;
-        // timer1.start();
         dt *d_G2=NULL, *d_A3=NULL, *h_G2=NULL;
         m = ttRanks[1] * ttDemns[1]; //4
-        n = n/ttDemns[1]; //16
+        n = n/ttDemns[1] * ttDemns[6]; //16
         cudaStat1 = cudaMalloc((void**)&d_G2, sizeof(dt)*m*ttRanks[2]);
         cudaStat2 = cudaHostAlloc((void**)&h_G2,sizeof(dt)*m*ttRanks[2],0);
-        cudaStat2 = cudaMalloc((void**)&d_A3, sizeof(dt)*n*ttRanks[2]);
+        cudaStat3 = cudaMalloc((void**)&d_A3, sizeof(dt)*n*ttRanks[2]);
         assert(cudaStat1 == cudaSuccess);
         assert(cudaStat2 == cudaSuccess);
+        assert(cudaStat3 == cudaSuccess);
         // printMatrix_Device(10, 10, d_A2, 10, "A22");
         // printMatrix_Device(m, n, d_A2, m, "A22");
         longMatrixSVD_Eign_once_device(cublasH, cusolverH, d_A2, m, n, ttRanks[2] , d_G2, d_A3, p);
@@ -1384,61 +1324,52 @@ float ttdec_half_lu_host_6_multiGPU(dt* h_A, const int *ttRanks, const int *ttDe
 
 
 
-
 int main(){
-    ofstream ofs;
-    ofs.open("result_8.txt", ios::out);
-    for(int i = 8; i < 40; i=i+4){
-        const int k = i;
-        int calculateTimes = 10;
+for(int i = 8; i < 44; i=i+4){
+    const int k = i;
+    int calculateTimes = 10;
 
-        bool calError = true;   
-        if(calError)
-            calculateTimes = 1;
-        int mid_rank = 4;
-        if(k == 2)
-            mid_rank = 2;
-        if(k == 4)
-            mid_rank = 2;
-        if(k > 24){
-            mid_rank = 8;
-        }
-        if(k > 52){
-            mid_rank = 8;
-        }
-        int ttRanks[7] = {1, mid_rank, mid_rank, mid_rank, mid_rank, mid_rank, 1};
-        int ttDemns[6] = {k, k, k, k, k, k};
-
-        int p = 8;
-        if(k == 2)
-            p=2;
-        int m = k;
-        long long n = pow(k,5);
-        printf("%lld , mid_rank = %d, k = %d \n", sizeof(dt)*m*n, mid_rank,k);
-        srand(1134);
-        dt *h_A = NULL;
-        cudaStat1 = cudaHostAlloc((void**)&h_A,sizeof(dt)*m*n,0);
-        assert(cudaStat1 == cudaSuccess);
-        generalTTTensor(h_A, ttRanks, ttDemns, p);
-        // printMatrix(10,10,h_A,10,"A");
-        warmupcu();
-        // ttdec_half_lu_host_6_multiGPU(h_A, ttRanks, ttDemns, 1, p, calError);
-        float time = 0;
-        if(k<40){
-            printf("device\n");
-            // ttdec_half_lu_device_6_multiGPU(h_A, ttRanks, ttDemns, 1, p, calError);
-            time = ttdec_half_lu_device_6_multiGPU(h_A, ttRanks, ttDemns, calculateTimes, p, calError);
-        }
-        else{
-            printf("host\n");
-            // ttdec_half_lu_host_6_multiGPU(h_A, ttRanks, ttDemns, 1, p, calError);
-            time = ttdec_half_lu_host_6_multiGPU(h_A, ttRanks, ttDemns, calculateTimes, p, calError);
-        }
-
-        printf("*************time****************\n %f \n*******************************\n", time);
-        ofs << "Size： " << i << " CPU Time:  " << time << endl;
-        if(h_A      ) cudaFreeHost(h_A); h_A = NULL;  
+    bool calError = true;
+    if(calError)
+        calculateTimes = 1;
+    int mid_rank = 4;
+    if(k == 2)
+        mid_rank = 2;
+    if(k == 4)
+        mid_rank = 2;
+    if(k > 24){
+        mid_rank = 8;
     }
-    ofs.close();
+    int ttRanks[7] = {2, mid_rank/2, mid_rank, mid_rank, mid_rank, mid_rank, 2};
+    int ttDemns[6] = {k, k, k, k, k, k};
+
+    int p = 8*8;
+    if(k == 2)
+        p=2;
+    int m = k;
+    long long n = pow(k,5);
+    printf("%lld , mid_rank = %d, k = %d \n", sizeof(dt)*m*n, mid_rank,k);
+    srand(1134);
+    dt *h_A = NULL;
+    cudaStat1 = cudaHostAlloc((void**)&h_A,sizeof(dt)*m*n,0);
+    assert(cudaStat1 == cudaSuccess);
+    generalTRTensor(h_A, ttRanks, ttDemns, p);
+    // printMatrix(10,10,h_A,10,"A");
+    warmupcu();
+    // trdec_half_lu_host_6_multiGPU(h_A, ttRanks, ttDemns, 1, p, calError);
+    float time = 0;
+    if(k<=40){
+        printf("device\n");
+       time = trdec_half_lu_device_6_multiGPU(h_A, ttRanks, ttDemns, calculateTimes, p, calError);
+    }
+    else{
+        printf("host\n");
+        time = trdec_half_lu_host_6_multiGPU(h_A, ttRanks, ttDemns, calculateTimes, p, calError);
+    }
+
+    printf("*************time****************\n %f \n*******************************\n", time);
+ 
+    if(h_A      ) cudaFreeHost(h_A); h_A = NULL;  
+}
     return 0;
 }
