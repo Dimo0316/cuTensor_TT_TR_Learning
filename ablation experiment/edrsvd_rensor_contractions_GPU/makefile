@@ -1,7 +1,7 @@
 cc=/usr/local/cuda/bin/nvcc
 des=ttdec2 
 
-source =  main.cpp  kernel.cu ttdec_gpu_float_rsvd_lu_half.cu
+source =  main.cpp  kernel.cu ttdec_gpu_float_edrsvd_rensor_contractions.cu
 #source =  main.cpp  kernel.cu ttdec_gpu_float.cu
 #source =  main.cpp  kernel.cu ttdec_gpu_double.cu 
 link = -lcublas -lcusolver -lcurand -std=c++11

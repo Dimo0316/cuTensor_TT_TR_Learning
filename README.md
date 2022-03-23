@@ -7,13 +7,13 @@ This repository contains applications for TT tensor learning using GPU tensor co
 
 > cuTensor_TT_TR_Learning
 >> ttdecomposition
->>> third_order -------- third order tt decomposition <br>
+>>> third_order_GPU -------- third order tt decomposition <br>
 >>>> python -------- python implementations  <br>
 >>>> unopt -------- unoptimized on single GPU <br>
 >>>> opt -------- optimized on single GPU <br>
 
 
->>> high_order -------- high order tt decomposition <br>
+>>> high_order_GPUs -------- high order tt decomposition <br>
 >>>> python -------- python implementations <br>
 >>>> ttdec6_singleGPU.cu -------- optimized single GPU <br>
 >>>> ttdec6_multiGPUs_2.cu -------- optimized on two GPUs <br>
@@ -22,12 +22,12 @@ This repository contains applications for TT tensor learning using GPU tensor co
 
 
 >> trdecomposition
->>> third_order -------- third order tr decomposition <br>
+>>> third_order_GPU -------- third order tr decomposition <br>
 >>>> python -------- python implementations  <br>
 >>>> unopt -------- unoptimized on single GPU <br>
 >>>> opt -------- optimized on single GPU <br>
 
->>> high_order -------- high order tr decomposition <br>
+>>> high_order_GPUs -------- high order tr decomposition <br>
 >>>> python -------- python implementations <br>
 >>>> trdec6_singleGPU.cu -------- optimized on single GPU  <br>
 >>>> trdec6_multiGPUs_2.cu -------- optimized on two GPUs  <br>
@@ -35,9 +35,9 @@ This repository contains applications for TT tensor learning using GPU tensor co
 >>>> trdec6_multiGPUs_8.cu -------- optimized on eight GPUs  <br>
 
 >> ablation -------- ablition experiments <br>
->>> edrsvd -------- only EDrSVD <br>
->>> edrsvd_pipeline -------- EDrSVD using piepline <br>
->>> edrsvd_rensor_contractions -------- EDrSVD using tensor contractions <br>
+>>> edrsvd_GPU -------- only EDrSVD <br>
+>>> edrsvd_pipeline_GPU -------- EDrSVD using piepline <br>
+>>> edrsvd_rensor_contractions_GPU -------- EDrSVD using tensor contractions <br>
 
 >> TT_tensor_layer
 >>> mnist.py -------- fully connect <br>
